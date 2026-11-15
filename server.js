@@ -150,6 +150,15 @@ function decide(input) {
   if (amount > maxTransfer) {
     return { decision: 'REJECT', reason_code: 'AMOUNT_OVERFLOW', proofTx };
   }
+  // Advisory only (logged, not a rejection): the registered key in the
+  // envelope differs from the platform's published vkHash. The spec's trap
+  // definition is proof_vk != registered_vk, so this alone does not reject
+  // — but it is suspicious and worth seeing in logs. (Adopted from hi5's
+  // gatekeeper-core.js after the 15 Nov comparison; see notes/HI5_COMPARISON.md.)
+  if (registeredVk !== VK_HASH) {
+    console.warn(`[gatekeeper] WARN: registered_vk differs from platform vkHash`);
+  }
+
   return { decision: 'APPROVE', reason_code: 'VALID_CONDITION', proofTx };
 }
 
@@ -278,12 +287,24 @@ async function handleTask(req, res, rawBody) {
   }
 
   // 4. Deterministic decision (fail closed: any error -> REJECT).
+  // Past-deadline tasks fail closed as EXPIRED_CONDITION before any
+  // proving is attempted on a late answer. (Adopted from hi5's
+  // gatekeeper-core.js after the 15 Nov comparison; see notes/HI5_COMPARISON.md.)
   let result;
-  try {
-    result = decide(task.input);
-  } catch (e) {
-    console.error('[gatekeeper] decide error (fail closed):', e.message);
-    result = { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH', proofTx: normHash(task.input.proof_tx || '') };
+  if (task.deadline_at) {
+    const deadlineMs = Date.parse(task.deadline_at);
+    if (!Number.isNaN(deadlineMs) && Date.now() > deadlineMs) {
+      console.warn(`[gatekeeper] ${task.task_id}: past deadline_at, fail closed`);
+      result = { decision: 'REJECT', reason_code: 'EXPIRED_CONDITION', proofTx: normHash(task.input.proof_tx || '') };
+    }
+  }
+  if (!result) {
+    try {
+      result = decide(task.input);
+    } catch (e) {
+      console.error('[gatekeeper] decide error (fail closed):', e.message);
+      result = { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH', proofTx: normHash(task.input.proof_tx || '') };
+    }
   }
 
   // 5. Proof. PROOF_REUSED tasks have no proof to submit (platform scoring

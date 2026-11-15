@@ -74,6 +74,14 @@ const CASES = [
   { name: 'EDGE current == expiry-1 approves', t: task('gk_edge_3', { current_block: 19842200 }), want: ['APPROVE', 'VALID_CONDITION'], proof: true },
 ];
 
+// Past-deadline task (deadline_at in the past) -> fail closed as
+// EXPIRED_CONDITION. No proof can exist: every circuit check passes on this
+// otherwise-valid task, so decision=0 has no valid witness (same situation
+// as PROOF_REUSED) — expect the decision returned without a proof.
+const lateTask = task('gk_late_1');
+lateTask.deadline_at = new Date(Date.now() - 1000).toISOString();
+CASES.push({ name: 'LATE (deadline_at in the past)', t: lateTask, want: ['REJECT', 'EXPIRED_CONDITION'], proof: false });
+
 (async () => {
   // Clean runtime state so the reused case is deterministic.
   for (const f of ['seen.json', 'decisions.json']) {
