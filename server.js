@@ -208,28 +208,71 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise.finally(() => clearTimeout(timer)), timeout]);
 }
 
-// Optional Kurier submission (fire-and-forget; never blocks the 60s response).
-// Requires KURIER_API_KEY (mainnet). The response already carries the raw
-// proof for the platform's offline re-verification, so Kurier is a bonus
-// on-chain audit trail, not on the critical path.
-async function submitToKurier(proof, publicSignals) {
+// Kurier submission — REQUIRED for scored proofs to count as verified.
+// The platform scores -2 "proof_failure" per task when the proof is not
+// confirmed on-chain (observed R04: 0/2 verified, hi5 identical despite a
+// different encoding; top agents with Kurier verify). Requires KURIER_API_KEY
+// (mainnet, free). Awaited with a bounded budget inside the 60s task
+// deadline: submit the proof, poll job-status until Finalized, and return
+// the on-chain tx hash to use as response.proof_tx. Any failure returns
+// null (non-fatal) and the caller keeps the platform's input proof_tx echo.
+const KURIER_TIMEOUT_MS = parseInt(process.env.KURIER_TIMEOUT_MS || '40000', 10);
+const KURIER_POLL_MS = 3000;
+
+async function kurierSubmitOnce(proof, publicSignals, vkRegistered) {
+  const body = {
+    proofType: 'groth16',
+    vkRegistered,
+    proofOptions: { library: 'snarkjs', curve: 'bn128' },
+    proofData: { proof, publicSignals, vk: vkRegistered ? VK_HASH : vk },
+  };
+  const res = await fetch(`${KURIER_URL}/submit-proof/${KURIER_API_KEY}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error('kurier submit HTTP ' + res.status);
+  const job = await res.json();
+  return job.jobId || job.job_id || job.id || null;
+}
+
+async function kurierPoll(jobId, deadlineMs) {
+  while (Date.now() < deadlineMs) {
+    const res = await fetch(`${KURIER_URL}/job-status/${KURIER_API_KEY}/${jobId}`);
+    if (res.ok) {
+      const st = await res.json();
+      const status = String(st.status || st.state || '').toLowerCase();
+      if (status === 'finalized' || status === 'success' || status === 'verified') {
+        return st.txHash || st.tx_hash || st.transactionHash || st.proofTx || null;
+      }
+      if (status === 'failed' || status === 'error' || status === 'rejected') {
+        throw new Error('kurier job ' + status);
+      }
+    }
+    await new Promise((r) => setTimeout(r, KURIER_POLL_MS));
+  }
+  throw new Error('kurier poll timed out');
+}
+
+async function submitToKurier(proof, publicSignals, budgetMs) {
   if (!KURIER_API_KEY) return null;
+  const deadlineMs = Date.now() + Math.max(0, budgetMs);
   try {
-    const res = await fetch(`${KURIER_URL}/submit-proof/${KURIER_API_KEY}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        proofType: 'groth16',
-        vkRegistered: true,
-        proofOptions: { library: 'snarkjs', curve: 'bn128' },
-        proofData: { proof, publicSignals, vk: VK_HASH },
-      }),
-    });
-    const job = await res.json();
-    console.log('[gatekeeper] kurier job:', JSON.stringify(job).slice(0, 300));
-    return job;
+    let jobId = null;
+    try {
+      jobId = await kurierSubmitOnce(proof, publicSignals, true);
+    } catch (e) {
+      // Fallback (redsparksz pattern): retry with the full vk inline.
+      if (!vk) throw e;
+      console.warn('[gatekeeper] kurier submit vkRegistered:true failed, retrying with full vk:', e.message);
+      jobId = await kurierSubmitOnce(proof, publicSignals, false);
+    }
+    if (!jobId) throw new Error('kurier submit returned no jobId');
+    const txHash = await kurierPoll(jobId, deadlineMs);
+    if (txHash) console.log('[gatekeeper] kurier Finalized, txHash:', txHash);
+    return txHash || null;
   } catch (e) {
-    console.error('[gatekeeper] kurier submit failed (non-fatal):', e.message);
+    console.error('[gatekeeper] kurier failed (non-fatal, keeping echo proof_tx):', e.message);
     return null;
   }
 }
@@ -322,7 +365,16 @@ async function handleTask(req, res, rawBody) {
       response.proof = proof;
       response.public_signals = public_signals;
       console.log(`[gatekeeper] ${task.task_id} ${result.decision}/${result.reason_code} proof ok in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-      submitToKurier(proof, public_signals); // async, non-blocking
+      // Kurier: submit + wait for Finalized (bounded by the task deadline),
+      // then use the on-chain tx hash as proof_tx so the platform counts
+      // the proof as verified. On any failure keep the echo proof_tx.
+      const deadlineMs = task.deadline_at ? Date.parse(task.deadline_at) : 0;
+      let kurierBudget = KURIER_TIMEOUT_MS;
+      if (deadlineMs) kurierBudget = Math.min(kurierBudget, deadlineMs - Date.now() - 5000);
+      if (kurierBudget > 0) {
+        const txHash = await submitToKurier(proof, public_signals, kurierBudget);
+        if (txHash) response.proof_tx = txHash;
+      }
     } catch (e) {
       console.error(`[gatekeeper] ${task.task_id} proof FAILED (decision still returned):`, e.message);
     }
