@@ -28,6 +28,20 @@ const DECISIONS_PATH = process.env.GATEKEEPER_DECISIONS_FILE || path.join(__dirn
 const KURIER_API_KEY = process.env.KURIER_API_KEY || '';
 const KURIER_URL = process.env.KURIER_URL || 'https://api.kurier.xyz/api/v1';
 const VK_HASH = process.env.GATEKEEPER_VK_HASH || '0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0';
+
+// Persistent seen-set backend (Upstash Redis, REST API, no new dependency).
+// Enabled only when BOTH UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN
+// are set. The local seen.json + in-memory Set stay as cache/fallback:
+// Railway's disk is wiped on every redeploy, so the local set alone cannot
+// catch a proof_tx reused across redeploys (R05: -6 on a reused APPROVE
+// after a redeploy wiped the earlier entries — same trap as hi5's agent;
+// their fix in cervus-snoopy/agent-games-gatekeeper, "persistent seen-set
+// (Redis)", is mirrored here).
+const UPSTASH_REDIS_REST_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const REDIS_ENABLED = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
+const REDIS_KEY = 'seen-proof-tx';
+const REDIS_TIMEOUT_MS = 2000;
 // BN128 scalar field modulus (for encoding 256-bit hashes as field elements).
 const FIELD_MODULUS = BigInt('21888242871839275222246405745257275088548364400416034343698204186575808495617');
 const PROOF_TIMEOUT_MS = parseInt(process.env.GATEKEEPER_PROOF_TIMEOUT_MS || '45000', 10);
@@ -49,6 +63,45 @@ function saveJson(file, obj) {
 const seenProofTx = new Set(loadJson(SEEN_PATH, []));
 // task_id -> last signed response body (idempotency: same task retried returns same decision).
 const decisionsByTask = loadJson(DECISIONS_PATH, {});
+
+// ------------------------------------------------------- Redis seen-set ---
+async function redisCall(command, member) {
+  const res = await fetch(UPSTASH_REDIS_REST_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify([command, REDIS_KEY, member]),
+    signal: AbortSignal.timeout(REDIS_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`Redis HTTP ${res.status}`);
+  const body = await res.json();
+  if (body && body.error) throw new Error(`Redis error: ${body.error}`);
+  return body.result;
+}
+
+// true / false, or null when Redis is disabled/unavailable (caller then
+// falls back to the local seen-set — never fail a task over Redis).
+async function redisIsMember(proofTx) {
+  if (!REDIS_ENABLED) return null;
+  try {
+    const result = await redisCall('SISMEMBER', proofTx);
+    return result === 1 || result === '1';
+  } catch (e) {
+    console.warn('[gatekeeper] WARN: Redis SISMEMBER failed, using local seen-set:', e.message);
+    return null;
+  }
+}
+
+async function redisAdd(proofTx) {
+  if (!REDIS_ENABLED) return;
+  try {
+    await redisCall('SADD', proofTx);
+  } catch (e) {
+    console.warn('[gatekeeper] WARN: Redis SADD failed, proof_tx recorded locally only:', e.message);
+  }
+}
 
 let vk = null;
 try { vk = JSON.parse(fs.readFileSync(VK_PATH, 'utf8')); } catch (e) { console.warn('[gatekeeper] vk.json not found, local proof verification disabled:', e.message); }
@@ -116,10 +169,13 @@ function vkHashToField(hex) {
 
 // ---------------------------------------------------------------- decision
 // Trap-check order follows the order the traps are listed on
-// /events/proof-gatekeeper (VK, THRESHOLD, REUSED, EXPIRED, RECIPIENT, AMOUNT).
-// Order only matters when a task carries several traps at once; the platform
-// does not document a priority, so this is an assumption.
-function decide(input) {
+// /events/proof-gatekeeper (VK, THRESHOLD, EXPIRED, RECIPIENT, AMOUNT),
+// except REUSED, which is checked LAST on purpose: it is the only
+// non-circuit check, so it must not shadow a circuit-visible failure that
+// carries a provable proof. Order only matters when a task carries several
+// traps at once; the platform does not document a priority, so this is an
+// assumption.
+async function decide(input) {
   const registeredVk = normHash(input.registered_vk);
   const proofVk = normHash(input.proof_vk);
   const minimum = toBigInt(input.minimum);
@@ -138,9 +194,6 @@ function decide(input) {
   if (balance < minimum) {
     return { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH', proofTx };
   }
-  if (proofTx && seenProofTx.has(proofTx)) {
-    return { decision: 'REJECT', reason_code: 'PROOF_REUSED', proofTx };
-  }
   if (currentBlock >= expiryBlock) {
     return { decision: 'REJECT', reason_code: 'EXPIRED_CONDITION', proofTx };
   }
@@ -149,6 +202,15 @@ function decide(input) {
   }
   if (amount > maxTransfer) {
     return { decision: 'REJECT', reason_code: 'AMOUNT_OVERFLOW', proofTx };
+  }
+  // Reuse check LAST: it is the only non-circuit check. When any
+  // circuit-visible check above already fails, that reason (with a
+  // provable proof) wins; PROOF_REUSED (decision-only, no valid proof
+  // exists for it) is returned only when every circuit-visible check
+  // passes. Redis is the durable source of truth; the local set is the
+  // fallback when Redis is unset or unreachable.
+  if (proofTx && (seenProofTx.has(proofTx) || (await redisIsMember(proofTx)))) {
+    return { decision: 'REJECT', reason_code: 'PROOF_REUSED', proofTx };
   }
   // Advisory only (logged, not a rejection): the registered key in the
   // envelope differs from the platform's published vkHash. The spec's trap
@@ -343,11 +405,21 @@ async function handleTask(req, res, rawBody) {
   }
   if (!result) {
     try {
-      result = decide(task.input);
+      result = await decide(task.input);
     } catch (e) {
       console.error('[gatekeeper] decide error (fail closed):', e.message);
       result = { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH', proofTx: normHash(task.input.proof_tx || '') };
     }
+  }
+
+  // Record the proof_tx as seen (any decision) so a later reuse is a trap.
+  // Local file first (cache), then Redis (durable). Recorded BEFORE proof
+  // generation so a slow/failed proof still leaves the record behind.
+  // A Redis failure only warns — the decision stands either way.
+  if (result.proofTx) {
+    seenProofTx.add(result.proofTx);
+    saveJson(SEEN_PATH, [...seenProofTx]);
+    await redisAdd(result.proofTx);
   }
 
   // 5. Proof. PROOF_REUSED tasks have no proof to submit (platform scoring
@@ -382,8 +454,8 @@ async function handleTask(req, res, rawBody) {
     console.log(`[gatekeeper] ${task.task_id} REJECT/PROOF_REUSED (no proof attached)`);
   }
 
-  // 6. Record proof_tx as seen + cache decision by task_id (persisted).
-  if (result.proofTx) { seenProofTx.add(result.proofTx); saveJson(SEEN_PATH, [...seenProofTx]); }
+  // 6. Cache decision by task_id (persisted). The proof_tx was already
+  // recorded as seen right after the decision (step 4b, local + Redis).
   decisionsByTask[task.task_id] = response;
   saveJson(DECISIONS_PATH, decisionsByTask);
 
@@ -401,6 +473,7 @@ const server = http.createServer(async (req, res) => {
         uptime_s: Math.floor(process.uptime()),
         hmac_configured: Boolean(HMAC_SECRET),
         kurier_configured: Boolean(KURIER_API_KEY),
+        redis_configured: REDIS_ENABLED,
         seen_proof_refs: seenProofTx.size,
       });
     }
@@ -418,7 +491,7 @@ const server = http.createServer(async (req, res) => {
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
     console.log(`[gatekeeper] listening on http://${HOST}:${PORT} (POST /agent, GET /health)`);
-    console.log(`[gatekeeper] hmac_configured=${Boolean(HMAC_SECRET)} kurier_configured=${Boolean(KURIER_API_KEY)}`);
+    console.log(`[gatekeeper] hmac_configured=${Boolean(HMAC_SECRET)} kurier_configured=${Boolean(KURIER_API_KEY)} redis_configured=${REDIS_ENABLED} seen_proof_refs=${seenProofTx.size}`);
   });
 }
 
