@@ -146,14 +146,24 @@ function toBigInt(v) {
   if (/^0x/i.test(s)) return BigInt(s);
   return BigInt(s);
 }
-// task_id like "gk_24_9d1" is a string; the circuit takes a field element.
-// Encoding (GUESS — see GATEKEEPER_BUILD.md open questions): UTF-8 bytes
-// as one big-endian integer. Short ids fit in the field; long ones wrap mod p.
+// taskId encoding — CHANGED 19 Nov 2026 (hi5, proven live 18 Nov 2026):
+// the platform expects the task UUID as a field element: BigInt of the UUID
+// hex (dashes stripped). A UUID is 128-bit, FIELD_MODULUS ~254-bit, so it
+// fits exactly with no mod wrap. The previous UTF-8-bytes encoding scored
+// +10 on every correct task (platform proof_failure, -2). Local probe
+// confirms public signal[12] IS the taskId. Non-UUID ids (practice/probe)
+// fall back to sha256 mod p so the harness keeps working. Salt UNCHANGED
+// here (one variable at a time); if R07 still scores +10, the salt /
+// commitment is the next suspect — local probe shows signal[0] binds BOTH
+// salt and taskId, so a random salt would also break a commitment check.
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+function sha256Hex(str) {
+  return '0x' + crypto.createHash('sha256').update(str, 'utf8').digest('hex');
+}
 function taskIdToField(taskId) {
-  const bytes = Buffer.from(String(taskId || ''), 'utf8');
-  let n = 0n;
-  for (const b of bytes) n = (n << 8n) | BigInt(b);
-  return (n % FIELD_MODULUS).toString();
+  const m = String(taskId || '').match(UUID_RE);
+  if (m) return BigInt('0x' + m[0].replace(/-/g, '')).toString();
+  return (BigInt(sha256Hex(String(taskId || ''))) % FIELD_MODULUS).toString();
 }
 function addrToField(addr) {
   const n = BigInt('0x' + (normAddr(addr) || '0'));
